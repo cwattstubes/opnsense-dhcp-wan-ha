@@ -1,0 +1,5 @@
+#!/bin/sh
+# Boot-time reconciliation after OPNsense networking initialization.
+# Not a pre-boot fence: it cannot prevent a brief WAN lease during early boot.
+/bin/sleep 10
+exec /usr/local/sbin/wan-ha-control apply

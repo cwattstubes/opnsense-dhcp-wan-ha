@@ -1,0 +1,156 @@
+#!/bin/sh
+# Single-DHCP-WAN ownership, governed by CARP VHID 1 on vtnet1.
+# Tested syntax only; validate operational behavior on OPNsense before production.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+LOG=/var/log/wan-ha.log
+LOCK=/var/run/wan-ha.lock
+
+log() {
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $(hostname) $*" >> "$LOG"
+    /usr/bin/logger -t wan-ha "$*"
+}
+
+carp_state() {
+    /sbin/ifconfig vtnet1 2>/dev/null | /usr/bin/awk \
+        '$1 == "carp:" && $3 == "vhid" && $4 == "1" { print $2; exit }'
+}
+
+has_ipv4() {
+    /sbin/ifconfig vtnet0 2>/dev/null | /usr/bin/grep -qE '^[[:space:]]*inet[[:space:]]'
+}
+
+case "${1:-}" in
+    status)
+        echo "CARP VHID 1: $(carp_state)"
+        /sbin/ifconfig vtnet0 | /usr/bin/grep -E 'flags=|inet |status:'
+        /usr/bin/pgrep -fl 'dhclient.*vtnet0' || :
+        exit 0
+        ;;
+    apply)
+        exec /usr/bin/lockf -t 120 "$LOCK" "$0" --locked
+        ;;
+    --locked)
+        ;;
+    *)
+        echo "Usage: $0 {status|apply}" >&2
+        exit 2
+        ;;
+esac
+
+if [ "$(id -u)" != 0 ]; then
+    log "ERROR must be root"
+    exit 1
+fi
+
+pass=1
+while [ "$pass" -le 3 ]; do
+    STATE=$(carp_state)
+    case "$STATE" in
+        MASTER) ACTION=enable ;;
+        BACKUP) ACTION=disable ;;
+        *)
+            log "ERROR refusing to change WAN: VHID 1 state is '${STATE:-unknown}'"
+            exit 1
+            ;;
+    esac
+    log "PASS=$pass CARP=$STATE action=$ACTION"
+
+    # The PHP snippet updates only the existing WAN 'enable' flag.
+    # On BACKUP, interface_reset() must execute BEFORE removing that flag;
+    # configctl interface reconfigure wan alone cannot tear down a disabled WAN.
+    RESULT=$(
+        WAN_HA_ACTION="$ACTION" /usr/local/bin/php 2>&1 <<'PHP'
+<?php
+require_once '/usr/local/etc/inc/config.inc';
+require_once '/usr/local/etc/inc/util.inc';
+require_once '/usr/local/etc/inc/system.inc';
+require_once '/usr/local/etc/inc/interfaces.inc';
+
+global $config;
+$action = getenv('WAN_HA_ACTION');
+$wan = $config['interfaces']['wan'] ?? null;
+if (!is_array($wan) || ($wan['if'] ?? '') !== 'vtnet0') {
+    fwrite(STDERR, "Unexpected WAN assignment; expected vtnet0\n");
+    exit(2);
+}
+if (($wan['ipaddr'] ?? '') !== 'dhcp') {
+    fwrite(STDERR, "Unexpected WAN addressing; expected dhcp\n");
+    exit(2);
+}
+$changed = false;
+if ($action === 'enable') {
+    if (!isset($config['interfaces']['wan']['enable'])) {
+        $config['interfaces']['wan']['enable'] = '1';
+        $changed = true;
+    }
+} elseif ($action === 'disable') {
+    // Stop dhclient, flush WAN addresses, and clean up interface state
+    // while OPNsense still has the original DHCP interface configuration.
+    interface_reset('wan');
+    if (isset($config['interfaces']['wan']['enable'])) {
+        unset($config['interfaces']['wan']['enable']);
+        $changed = true;
+    }
+} else {
+    fwrite(STDERR, "Invalid WAN action\n");
+    exit(2);
+}
+if ($changed) {
+    $result = write_config("CARP WAN HA: $action WAN");
+    if ($result === false || $result === -1) {
+        fwrite(STDERR, "Unable to save configuration\n");
+        exit(1);
+    }
+}
+echo 'WAN_HA_CHANGED=' . ($changed ? '1' : '0') . "\n";
+PHP
+    )
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+        log "ERROR PHP WAN action=$ACTION exit=$RC output=$RESULT"
+        exit 1
+    fi
+    log "PHP WAN action=$ACTION output=$RESULT"
+
+    if [ "$ACTION" = enable ]; then
+        if [ "$RESULT" = 'WAN_HA_CHANGED=0' ] && has_ipv4; then
+            log "WAN already configured and has IPv4 address; avoiding DHCP reset"
+        else
+            OUTPUT=$(/usr/local/sbin/configctl interface reconfigure wan 2>&1)
+            RC=$?
+            log "WAN reconfigure exit=$RC output=$OUTPUT"
+            if [ "$RC" -ne 0 ]; then
+                exit 1
+            fi
+        fi
+    fi
+
+    OUTPUT=$(/usr/local/sbin/configctl filter reload 2>&1)
+    RC=$?
+    log "Firewall reload exit=$RC output=$OUTPUT"
+    if [ "$RC" -ne 0 ]; then
+        exit 1
+    fi
+
+    NEW_STATE=$(carp_state)
+    if [ "$NEW_STATE" = "$STATE" ]; then
+        if [ "$ACTION" = disable ]; then
+            if has_ipv4; then
+                log "ERROR WAN still has an IPv4 address after BACKUP reset"
+                exit 1
+            fi
+            log "COMPLETE BACKUP: WAN IPv4 removed"
+        else
+            if has_ipv4; then
+                log "COMPLETE MASTER: WAN has an IPv4 address; confirm DHCP lease and default route"
+            else
+                log "WARNING MASTER configured but no WAN IPv4 yet; inspect DHCP client and upstream"
+            fi
+        fi
+        exit 0
+    fi
+    log "CARP changed from $STATE to $NEW_STATE while processing; reconciling again"
+    pass=$((pass + 1))
+done
+log "ERROR CARP changed too frequently; manual reconciliation required"
+exit 1

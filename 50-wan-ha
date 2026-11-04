@@ -1,0 +1,11 @@
+#!/bin/sh
+# CARP syshook: OPNsense passes e.g. 1@vtnet1 MASTER
+[ "${1:-}" = '1@vtnet1' ] || exit 0
+case "${2:-}" in
+    MASTER|BACKUP)
+        exec /usr/local/sbin/wan-ha-control apply
+        ;;
+    *)
+        exit 0
+        ;;
+esac
